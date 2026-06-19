@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="ImpulsDispatcherDienst/ImpulsDispatcherDienst.vcxproj" Id="800195f4-6024-41f7-84a4-b099592b3d06" />
+</Solution>
