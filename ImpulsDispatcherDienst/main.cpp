@@ -13,31 +13,20 @@
 
 #define SERVICE_NAME L"ImpulsDispatcher"
 
+QUEUEHANDLE gInputQueue = nullptr;
+QUEUEHANDLE gDbQueue = nullptr;
+QUEUEHANDLE gErrorQueue = nullptr;
+
 SERVICE_STATUS gStatus = {};
 SERVICE_STATUS_HANDLE gStatusHandle = nullptr;
 HANDLE gStopEvent = nullptr;
 
 void WINAPI ServiceMain(DWORD argc, LPWSTR* argv);
 void WINAPI ServiceCtrlHandler(DWORD ctrlCode);
-
-void WriteLog(const std::wstring& text)
-{
-    std::wofstream file(L"C:\\Temp\\ImpulsDispatcher.log", std::ios::app);
-
-    if (file.is_open())
-    {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-
-        file << L"["
-            << st.wDay << L"." << st.wMonth << L"." << st.wYear
-            << L" "
-            << st.wHour << L":" << st.wMinute << L":" << st.wSecond
-            << L"] "
-            << text
-            << std::endl;
-    }
-}
+bool OpenPrivateQueue(const std::wstring& queueName, DWORD accessMode, QUEUEHANDLE* queueHandle);
+void WriteLog(const std::wstring& text);
+void CloseDispatcherQueues();
+bool OpenDispatcherQueues();
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
@@ -76,6 +65,15 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
 
     WriteLog(L"ImpulsDispatcher gestartet.");
 
+    if (!OpenDispatcherQueues())
+    {
+        WriteLog(L"Dispatcher kann nicht starten, Queues fehlen.");
+
+        gStatus.dwCurrentState = SERVICE_STOPPED;
+        SetServiceStatus(gStatusHandle, &gStatus);
+        return;
+    }
+
     gStatus.dwCurrentState = SERVICE_RUNNING;
     SetServiceStatus(gStatusHandle, &gStatus);
 
@@ -83,6 +81,8 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
     {
         WriteLog(L"Dispatcher läuft...");
     }
+
+    CloseDispatcherQueues();
 
     WriteLog(L"ImpulsDispatcher wird beendet.");
 
@@ -98,5 +98,111 @@ void WINAPI ServiceCtrlHandler(DWORD ctrlCode)
         SetServiceStatus(gStatusHandle, &gStatus);
 
         SetEvent(gStopEvent);
+    }
+}
+
+bool OpenPrivateQueue(const std::wstring& queueName, DWORD accessMode, QUEUEHANDLE* queueHandle)
+{
+    std::wstring pathName =
+        L".\\private$\\" + queueName;
+
+    DWORD formatNameLength = 256;
+    WCHAR formatName[256]{};
+
+    HRESULT hr = MQPathNameToFormatName(
+        pathName.c_str(),
+        formatName,
+        &formatNameLength);
+
+    if (FAILED(hr))
+    {
+        WriteLog(L"MQPathNameToFormatName fehlgeschlagen: " + pathName);
+        return false;
+    }
+
+    hr = MQOpenQueue(formatName, accessMode, MQ_DENY_NONE, queueHandle);
+
+    if (FAILED(hr))
+    {
+        WriteLog(L"MQOpenQueue fehlgeschlagen: " + pathName);
+        return false;
+    }
+
+    WriteLog(L"Queue geöffnet: " + pathName);
+
+    return true;
+}
+
+void WriteLog(const std::wstring& text)
+{
+    std::wofstream file(L"C:\\Temp\\ImpulsDispatcher.log", std::ios::app);
+
+    if (file.is_open())
+    {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+
+        file << L"["
+            << st.wDay << L"." << st.wMonth << L"." << st.wYear
+            << L" "
+            << st.wHour << L":" << st.wMinute << L":" << st.wSecond
+            << L"] "
+            << text
+            << std::endl;
+    }
+}
+
+bool OpenDispatcherQueues()
+{
+    bool ok = true;
+
+    if (!OpenPrivateQueue(L"impuls_in", MQ_RECEIVE_ACCESS, &gInputQueue))
+    {
+        ok = false;
+    }
+
+    if (!OpenPrivateQueue(L"impuls_db",MQ_SEND_ACCESS, &gDbQueue))
+    {
+        ok = false;
+    }
+
+    if (!OpenPrivateQueue(L"impuls_error", MQ_SEND_ACCESS, &gErrorQueue))
+    {
+        ok = false;
+    }
+
+    if (ok)
+    {
+        WriteLog(L"Alle Dispatcher-Queues erfolgreich geöffnet.");
+    }
+    else
+    {
+        WriteLog(L"FEHLER: Nicht alle Dispatcher-Queues konnten geöffnet werden.");
+    }
+
+    return ok;
+}
+
+void CloseDispatcherQueues()
+{
+    if (gInputQueue)
+    {
+        MQCloseQueue(gInputQueue);
+        gInputQueue = nullptr;
+        WriteLog(L"Queue geschlossen: impuls_in");
+    }
+
+    if (gDbQueue)
+    {
+        MQCloseQueue(gDbQueue);
+        gDbQueue = nullptr;
+        WriteLog(L"Queue geschlossen: impuls_db");
+    }
+
+    if (gErrorQueue)
+    {
+        MQCloseQueue(gErrorQueue);
+        gErrorQueue = nullptr;
+        WriteLog(L"Queue geschlossen: impuls_error");
     }
 }
