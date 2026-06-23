@@ -4,6 +4,7 @@
 #include <objbase.h>
 #include <propidl.h>
 #include <mq.h>
+#include <vector>
 
 #include <string>
 #include <fstream>
@@ -27,6 +28,10 @@ bool OpenPrivateQueue(const std::wstring& queueName, DWORD accessMode, QUEUEHAND
 void WriteLog(const std::wstring& text);
 void CloseDispatcherQueues();
 bool OpenDispatcherQueues();
+
+bool ReceiveMessageFromInput(std::wstring& xmlText);
+std::wstring ExtractTagValue(const std::wstring& xml, const std::wstring& tagName);
+void SendMessageToQueue(QUEUEHANDLE queueHandle, const std::wstring& xmlText, const std::wstring& label);
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
@@ -77,9 +82,37 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
     gStatus.dwCurrentState = SERVICE_RUNNING;
     SetServiceStatus(gStatusHandle, &gStatus);
 
-    while (WaitForSingleObject(gStopEvent, 2000) == WAIT_TIMEOUT)
+   /* while (WaitForSingleObject(gStopEvent, 2000) == WAIT_TIMEOUT)
     {
         WriteLog(L"Dispatcher läuft...");
+    }*/
+
+    while (WaitForSingleObject(gStopEvent, 1000) == WAIT_TIMEOUT)
+    {
+        std::wstring xmlText;
+
+        if (ReceiveMessageFromInput(xmlText))
+        {
+            WriteLog(L"Nachricht aus impuls_in empfangen.");
+
+            std::wstring commandId = ExtractTagValue(xmlText, L"CommandId");
+
+            if (commandId.empty())
+            {
+                WriteLog(L"CommandId fehlt. Nachricht geht nach impuls_error.");
+                SendMessageToQueue(gErrorQueue, xmlText, L"ERROR_NO_COMMANDID");
+            }
+            else if (commandId[0] == L'9')
+            {
+                WriteLog(L"CommandId " + commandId + L" erkannt. Nachricht geht nach impuls_db.");
+                SendMessageToQueue(gDbQueue, xmlText, L"DB_" + commandId);
+            }
+            else
+            {
+                WriteLog(L"CommandId " + commandId + L" unbekannter Bereich. Nachricht geht nach impuls_error.");
+                SendMessageToQueue(gErrorQueue, xmlText, L"ERROR_UNKNOWN_COMMANDID");
+            }
+        }
     }
 
     CloseDispatcherQueues();
@@ -204,5 +237,194 @@ void CloseDispatcherQueues()
         MQCloseQueue(gErrorQueue);
         gErrorQueue = nullptr;
         WriteLog(L"Queue geschlossen: impuls_error");
+    }
+}
+
+bool ReceiveMessageFromInput(std::wstring& xmlText)
+{
+    const DWORD BODY_BUFFER_SIZE = 64 * 1024;
+
+    std::vector<UCHAR> bodyBuffer(BODY_BUFFER_SIZE);
+
+    MQMSGPROPS msgProps{};
+    MSGPROPID propId[1]{};
+    MQPROPVARIANT propVar[1]{};
+    HRESULT status[1]{};
+
+    propId[0] = PROPID_M_BODY;
+
+    propVar[0].vt = VT_VECTOR | VT_UI1;
+    propVar[0].caub.pElems = bodyBuffer.data();
+    propVar[0].caub.cElems = BODY_BUFFER_SIZE;
+
+    msgProps.cProp = 1;
+    msgProps.aPropID = propId;
+    msgProps.aPropVar = propVar;
+    msgProps.aStatus = status;
+
+    HRESULT hr = MQReceiveMessage(
+        gInputQueue,
+        1000,
+        MQ_ACTION_RECEIVE,
+        &msgProps,
+        nullptr,
+        nullptr,
+        nullptr,
+        MQ_NO_TRANSACTION
+    );
+
+    if (hr == MQ_ERROR_IO_TIMEOUT)
+    {
+        return false;
+    }
+
+    if (FAILED(hr))
+    {
+        WriteLog(L"MQReceiveMessage fehlgeschlagen.");
+        return false;
+    }
+
+    DWORD bytesRead = propVar[0].caub.cElems;
+
+    if (bytesRead == 0)
+    {
+        WriteLog(L"Leere Nachricht empfangen.");
+        return false;
+    }
+
+    int needed = MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        reinterpret_cast<LPCCH>(bodyBuffer.data()),
+        static_cast<int>(bytesRead),
+        nullptr,
+        0
+    );
+
+    if (needed <= 0)
+    {
+        WriteLog(L"UTF-8 nach UTF-16 Konvertierung fehlgeschlagen.");
+        return false;
+    }
+
+    std::wstring result(needed, L'\0');
+
+    MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        reinterpret_cast<LPCCH>(bodyBuffer.data()),
+        static_cast<int>(bytesRead),
+        result.data(),
+        needed
+    );
+
+    xmlText = result;
+
+    return true;
+}
+
+std::wstring ExtractTagValue(const std::wstring& xml, const std::wstring& tagName)
+{
+    std::wstring startTag = L"<" + tagName + L">";
+    std::wstring endTag = L"</" + tagName + L">";
+
+    size_t start = xml.find(startTag);
+
+    if (start == std::wstring::npos)
+    {
+        return L"";
+    }
+
+    start += startTag.length();
+
+    size_t end = xml.find(endTag, start);
+
+    if (end == std::wstring::npos)
+    {
+        return L"";
+    }
+
+    std::wstring value = xml.substr(start, end - start);
+
+    while (!value.empty() && iswspace(value.front()))
+    {
+        value.erase(value.begin());
+    }
+
+    while (!value.empty() && iswspace(value.back()))
+    {
+        value.pop_back();
+    }
+
+    return value;
+}
+
+void SendMessageToQueue(
+    QUEUEHANDLE queueHandle,
+    const std::wstring& xmlText,
+    const std::wstring& label)
+{
+    int needed = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        xmlText.c_str(),
+        -1,
+        nullptr,
+        0,
+        nullptr,
+        nullptr
+    );
+
+    if (needed <= 0)
+    {
+        WriteLog(L"UTF-16 nach UTF-8 Konvertierung fehlgeschlagen.");
+        return;
+    }
+
+    std::string utf8Text(needed - 1, '\0');
+
+    WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        xmlText.c_str(),
+        -1,
+        utf8Text.data(),
+        needed,
+        nullptr,
+        nullptr
+    );
+
+    MQMSGPROPS msgProps{};
+    MSGPROPID propId[2]{};
+    MQPROPVARIANT propVar[2]{};
+    HRESULT status[2]{};
+
+    propId[0] = PROPID_M_LABEL;
+    propVar[0].vt = VT_LPWSTR;
+    propVar[0].pwszVal = const_cast<LPWSTR>(label.c_str());
+
+    propId[1] = PROPID_M_BODY;
+    propVar[1].vt = VT_VECTOR | VT_UI1;
+    propVar[1].caub.pElems = reinterpret_cast<UCHAR*>(utf8Text.data());
+    propVar[1].caub.cElems = static_cast<ULONG>(utf8Text.size());
+
+    msgProps.cProp = 2;
+    msgProps.aPropID = propId;
+    msgProps.aPropVar = propVar;
+    msgProps.aStatus = status;
+
+    HRESULT hr = MQSendMessage(
+        queueHandle,
+        &msgProps,
+        MQ_NO_TRANSACTION
+    );
+
+    if (FAILED(hr))
+    {
+        WriteLog(L"MQSendMessage fehlgeschlagen.");
+    }
+    else
+    {
+        WriteLog(L"Nachricht weitergeleitet: " + label);
     }
 }
